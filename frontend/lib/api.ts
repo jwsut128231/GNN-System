@@ -255,7 +255,7 @@ export interface Report {
   // + residual_data carry the data as before.
   label_columns?: string[];
   per_target_metrics?: Record<string, SplitMetrics>;
-  per_target_residuals?: Record<string, Array<{ actual: number; predicted: number }>>;
+  per_target_residuals?: Record<string, Array<{ actual: number; predicted: number; error: number }>>;
 }
 
 export interface RegisteredModel {
