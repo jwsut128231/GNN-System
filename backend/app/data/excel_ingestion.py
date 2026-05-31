@@ -28,7 +28,6 @@ import pandas as pd
 
 from app.data.excel_spec import (
     ExcelGraphSpec,
-    VALID_LEVELS,
     parse_parameter_sheet,
     validate_hetero_consistency,
 )

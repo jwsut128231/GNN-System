@@ -409,7 +409,7 @@ def validate_label(nodes_df: pd.DataFrame, column: str, task_type: str) -> dict:
             return {"valid": False, "message": f"Regression target has {non_numeric} non-numeric values."}
         return {
             "valid": True,
-            "message": f"Valid regression target.",
+            "message": "Valid regression target.",
             "is_continuous": series.nunique() > 10,
             "value_range": {
                 "min": round(float(numeric_series.min()), 4),

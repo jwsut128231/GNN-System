@@ -45,3 +45,13 @@ dev-dependencies = [
 [[tool.uv.index]]
 name = "pytorch-cu12"
 url = "https://download.pytorch.org/whl/cu124"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules call pytest.importorskip("torch") before importing the app code
+# it guards, so the app imports legitimately sit below a statement (E402). This
+# is the intended pattern for tests that skip cleanly without torch/PyG.
+"tests/*" = ["E402"]

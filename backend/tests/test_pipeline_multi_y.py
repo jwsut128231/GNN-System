@@ -17,7 +17,6 @@ from app.training.pipeline import (
     _prepare_node,
     _label_columns_for,
 )
-from app.training.target_scaler import TargetScaler
 
 
 def _make_multi_y_graph_dataset() -> dict:

@@ -31,7 +31,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-from app.routers import tasks, projects
+from app.routers import tasks, projects  # noqa: E402  (imported after app+middleware setup by design)
 
 app.include_router(tasks.router, prefix="/api/v1")
 app.include_router(projects.router, prefix="/api/v1")

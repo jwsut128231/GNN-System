@@ -1,6 +1,6 @@
 'use client';
 
-import { render, screen } from '@testing-library/react';
+import { render } from '@testing-library/react';
 import { Select } from 'antd';
 
 // Test: graph_index with many items uses client-side search (filterOption),

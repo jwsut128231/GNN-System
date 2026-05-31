@@ -1,7 +1,6 @@
 """Unit tests for _regression_metrics in training pipeline."""
 from __future__ import annotations
 
-import pytest
 
 from app.training.pipeline import _regression_metrics
 

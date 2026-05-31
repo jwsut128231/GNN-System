@@ -1,7 +1,6 @@
 """Tests for multi-target (multi-Y) PyG converter behaviour."""
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import torch
 

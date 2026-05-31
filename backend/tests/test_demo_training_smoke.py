@@ -49,7 +49,8 @@ def _prepare_homo(parsed: dict):
     gen = torch.Generator().manual_seed(0)
     perm = torch.randperm(len(data_list), generator=gen).tolist()
     n = len(data_list)
-    t1 = int(n * 0.6); t2 = int(n * 0.8)
+    t1 = int(n * 0.6)
+    t2 = int(n * 0.8)
     train = [data_list[i] for i in perm[:t1]]
     val = [data_list[i] for i in perm[t1:t2]]
     test = [data_list[i] for i in perm[t2:]]
@@ -67,7 +68,8 @@ def _prepare_hetero(parsed: dict):
     gen = torch.Generator().manual_seed(0)
     perm = torch.randperm(len(data_list), generator=gen).tolist()
     n = len(data_list)
-    t1 = int(n * 0.6); t2 = int(n * 0.8)
+    t1 = int(n * 0.6)
+    t2 = int(n * 0.8)
     train = [data_list[i] for i in perm[:t1]]
     val = [data_list[i] for i in perm[t1:t2]]
     test = [data_list[i] for i in perm[t2:]]

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from app.data.pyg_converter_hetero import _fit_scalers, _build_single_hetero
 
@@ -82,7 +81,6 @@ def test_scaler_excluded_cols_persisted_in_artifact(tmp_path):
 
 def test_scaler_skips_low_presence_columns():
     """Excluded 'sparse' column should appear as 0.0 in output tensor (fillna, no scaling)."""
-    from torch_geometric.data import HeteroData
 
     node_dfs = _make_node_dfs(20)
     scalers, feature_cols, excluded_cols = _fit_scalers(node_dfs, EXCLUDE, min_presence_ratio=0.1)

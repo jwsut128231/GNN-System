@@ -469,7 +469,7 @@ def run_training_task(task_id: str) -> None:
             test_metrics = _classification_metrics(test_y, test_preds)
             labels = sorted(set(test_y.tolist()) | set(test_preds.tolist()))
             cm_arr = sklearn_confusion_matrix(test_y, test_preds, labels=labels)
-            cm = {"labels": [str(l) for l in labels], "matrix": cm_arr.tolist()}
+            cm = {"labels": [str(lbl) for lbl in labels], "matrix": cm_arr.tolist()}
             residual = None
 
         report = {
