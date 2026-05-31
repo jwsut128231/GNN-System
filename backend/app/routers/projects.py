@@ -7,6 +7,7 @@ CSV endpoints have been removed.
 from __future__ import annotations
 
 import io
+import json
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -17,12 +18,13 @@ import numpy as np
 import pandas as pd
 import torch
 from fastapi import (
-    APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile,
+    APIRouter, BackgroundTasks, File, Form, HTTPException, Query, Request, UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.core import store
 from app.core.config import settings
+from app.data import graph_cache_sqlite
 from app.data.excel_ingestion import parse_excel_file
 from app.data.feature_engineering import (
     analyze_categorical_column,
@@ -88,6 +90,7 @@ def _task_to_status(task: dict, project_id: str) -> TaskStatus:
     return TaskStatus(
         task_id=task["task_id"], project_id=project_id, status=task["status"],
         progress=task.get("progress", 0),
+        current_phase=task.get("current_phase"),
         current_trial=task.get("current_trial"),
         total_trials=task.get("total_trials"),
         device=task.get("device"),
@@ -122,6 +125,12 @@ def _dataset_to_summary(ds: dict) -> DatasetSummary:
         is_heterogeneous=ds.get("is_heterogeneous", False),
         node_types=ds.get("node_types", []),
         edge_types=ds.get("edge_types", []),
+        label_columns=ds.get("label_columns") or (
+            [ds["label_column"]] if ds.get("label_column") else []
+        ),
+        label_weights=ds.get("label_weights") or (
+            [ds["label_weight"]] if ds.get("label_weight") is not None else []
+        ),
     )
 
 
@@ -160,12 +169,41 @@ DEMO_EXCELS = [
         "tags": ["multi-graph", "homogeneous", "graph-regression"],
     },
     {
+        "id": "multigraph_homo_no_type",
+        "name": "Multi-Graph Homogeneous (no Type column)",
+        "description": "30 graphs, homogeneous, Node/Edge/Graph sheets WITHOUT a Type column — auto-detected as homogeneous",
+        "filename": "demo_multigraph_homo_no_type.xlsx",
+        "is_heterogeneous": False,
+        "tags": ["multi-graph", "homogeneous", "graph-regression", "no-type-column"],
+    },
+    {
+        "id": "multigraph_multi_y",
+        "name": "Multi-Graph Multi-Y Regression",
+        "description": "30 graphs, homogeneous, two Y targets (target_delay weight=2.0 + target_power_mw weight=1.0 default), no Type column",
+        "filename": "demo_multigraph_multi_y.xlsx",
+        "is_heterogeneous": False,
+        "tags": ["multi-graph", "homogeneous", "graph-regression", "multi-y", "no-type-column"],
+    },
+    {
         "id": "multigraph_hetero",
         "name": "Multi-Graph Heterogeneous",
         "description": "30 graphs, 3 node types (cell/pin/net), 3 edge types, graph_regression target (total_wirelength)",
         "filename": "demo_multigraph_hetero.v2.xlsx",
         "is_heterogeneous": True,
         "tags": ["multi-graph", "heterogeneous", "graph-regression"],
+    },
+    {
+        "id": "hetero_multifeature_str",
+        "name": "Hetero Multi-Feature (string Graph_ID)",
+        "description": (
+            "30 graphs, string Graph_IDs (G001..G030), 2 node types (CAP/RES). "
+            "CAP nodes carry per-graph variable feature subsets "
+            "(X_1+X_2, X_1+X_3, X_2+X_3); target_y is a deterministic "
+            "linear function so loss is stable and metrics are sane."
+        ),
+        "filename": "demo_hetero_multifeature.v3.xlsx",
+        "is_heterogeneous": True,
+        "tags": ["multi-graph", "heterogeneous", "graph-regression", "string-graph-id", "multi-feature"],
     },
 ]
 
@@ -223,7 +261,41 @@ async def load_demo_excel(project_id: str, demo_id: str = Query(...)):
 
 # ── Upload Excel ──────────────────────────────────────────────────────────
 
+def _build_graph_index(nodes_df: pd.DataFrame, edges_df: pd.DataFrame) -> list[dict]:
+    """Return [{id, node_count, edge_count}, ...] per graph (quick pass)."""
+    if "_graph" not in nodes_df.columns:
+        return [{"id": "default", "node_count": len(nodes_df), "edge_count": len(edges_df)}]
+
+    node_counts = nodes_df.groupby("_graph").size().rename("node_count")
+    if "_graph" in edges_df.columns and not edges_df.empty:
+        edge_counts = edges_df.groupby("_graph").size().rename("edge_count")
+    else:
+        edge_counts = pd.Series(dtype=int, name="edge_count")
+
+    all_graphs = node_counts.index.union(edge_counts.index)
+    result = []
+    for g in all_graphs:
+        result.append({
+            "id": str(g),
+            "node_count": int(node_counts.get(g, 0)),
+            "edge_count": int(edge_counts.get(g, 0)),
+        })
+    return result
+
+
 async def _store_excel_dataset(project_id: str, content: bytes, name: str) -> DatasetSummary:
+    # Compute content hash for ETag / cache invalidation
+    excel_hash = graph_cache_sqlite.content_hash(content)
+
+    # Invalidate SQLite cache if re-upload with different content
+    existing_project = store.get_project(project_id)
+    if existing_project:
+        old_ds_id = existing_project.get("dataset_id")
+        if old_ds_id:
+            old_ds = store.get_dataset(old_ds_id)
+            if old_ds and old_ds.get("excel_hash") != excel_hash:
+                graph_cache_sqlite.invalidate(old_ds_id)
+
     try:
         parsed = parse_excel_file(content, name)
     except ValueError as e:
@@ -241,6 +313,9 @@ async def _store_excel_dataset(project_id: str, content: bytes, name: str) -> Da
     is_hetero = parsed["is_heterogeneous"]
     node_types = parsed["spec"].node_types()
     edge_types = parsed["spec"].edge_types()
+    _spec = parsed["spec"]
+    _node_type_features = {t: _spec.x_columns("Node", t) for t in node_types} if is_hetero else None
+    _edge_type_features = {t: _spec.x_columns("Edge", t) for t in edge_types} if is_hetero else None
 
     explore_stats = compute_generic_explore(
         nodes_df, edges_df,
@@ -249,7 +324,10 @@ async def _store_excel_dataset(project_id: str, content: bytes, name: str) -> Da
         canonical_edges=parsed["canonical_edges"],
         node_dfs=parsed["node_dfs"] if is_hetero else None,
         edge_dfs=parsed["edge_dfs"] if is_hetero else None,
+        node_type_features=_node_type_features,
+        edge_type_features=_edge_type_features,
     )
+    explore_stats["schema_warnings"] = parsed.get("schema_warnings", []) or []
     # Count unique numeric feature names (per-type entries with same name → one feature).
     _numeric_names = {c["name"] for c in explore_stats["columns"] if c["dtype"] == "numeric"}
     num_features = len(_numeric_names)
@@ -286,6 +364,8 @@ async def _store_excel_dataset(project_id: str, content: bytes, name: str) -> Da
         nodes_df_train = nodes_df_test = nodes_df
         edges_df_train = edges_df_test = edges_df
 
+    graph_index = _build_graph_index(nodes_df, edges_df)
+
     ds_record = {
         "dataset_id": dataset_id, "name": name,
         "num_nodes": len(nodes_df), "num_edges": len(edges_df),
@@ -309,6 +389,12 @@ async def _store_excel_dataset(project_id: str, content: bytes, name: str) -> Da
         "schema_spec": schema_payload,
         "label_column": label_column,
         "label_weight": parsed["label_weight"],
+        # Multi-Y support: parallel lists; for single-Y these are length-1.
+        "label_columns": parsed.get("label_columns") or [label_column],
+        "label_weights": parsed.get("label_weights") or [parsed["label_weight"]],
+        # Cache / ETag support
+        "excel_hash": excel_hash,
+        "graph_index": graph_index,
     }
     store.put_dataset(dataset_id, ds_record)
 
@@ -397,6 +483,7 @@ async def explore_project_data(project_id: str):
 
 @router.get("/{project_id}/graph-sample")
 async def get_graph_sample(
+    request: Request,
     project_id: str,
     limit: int = Query(default=500, ge=5, le=5000),
     graph_name: Optional[str] = Query(default=None),
@@ -404,10 +491,39 @@ async def get_graph_sample(
     """Return a sample of the project's graph data for preview.
 
     Returns node_type / edge_type for every item so the frontend can colour
-    heterogeneous graphs.
+    heterogeneous graphs. Supports ETag / 304 and SQLite caching per graph.
     """
     project = _project_or_404(project_id)
     ds = _dataset_for_project(project)
+    dataset_id = ds["dataset_id"]
+    excel_hash = ds.get("excel_hash", "")
+
+    # Default to the first graph on multi-graph datasets so the initial
+    # request doesn't fall back to a cross-graph BFS sample (which would
+    # briefly render every graph stacked on top of each other).
+    if not graph_name:
+        gi = ds.get("graph_index", [])
+        if len(gi) > 1:
+            graph_name = str(gi[0]["id"])
+
+    # ETag: encode dataset content + graph selection + limit
+    etag = f'"{excel_hash}-{graph_name or "all"}-{limit}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304)
+
+    # SQLite cache hit (only when a specific graph is selected).
+    # Cache key includes limit to avoid returning a 500-row sample for a
+    # later 100-row request (and vice-versa) -- see security-review #1.
+    cache_graph_id = f"{graph_name}|limit={limit}" if graph_name else None
+    if cache_graph_id and excel_hash:
+        cached = graph_cache_sqlite.get(dataset_id, cache_graph_id, excel_hash)
+        if cached is not None:
+            return Response(
+                content=cached,
+                media_type="application/json",
+                headers={"ETag": etag},
+            )
+
     nodes_df = ds["nodes_df"]
     edges_df = ds["edges_df"]
     graph_names = sorted(nodes_df["_graph"].dropna().unique().tolist()) \
@@ -423,13 +539,17 @@ async def get_graph_sample(
     sample_size = min(limit, len(nodes_df))
     all_node_ids = set(nodes_df["node_id"].values) if not nodes_df.empty else set()
 
+    # Build adjacency using vectorized pandas instead of iterrows
     adj: dict = defaultdict(set)
     if not edges_df.empty and "src_id" in edges_df.columns:
-        for _, row in edges_df.iterrows():
-            s, d = row["src_id"], row["dst_id"]
-            if s in all_node_ids and d in all_node_ids:
-                adj[s].add(d)
-                adj[d].add(s)
+        valid_mask = (
+            edges_df["src_id"].isin(all_node_ids) & edges_df["dst_id"].isin(all_node_ids)
+        )
+        valid_edges = edges_df[valid_mask][["src_id", "dst_id"]]
+        for rec in valid_edges.to_dict(orient="records"):
+            s, d = rec["src_id"], rec["dst_id"]
+            adj[s].add(d)
+            adj[d].add(s)
 
     if not nodes_df.empty:
         seed = nodes_df.sample(n=1, random_state=42)["node_id"].values[0]
@@ -487,31 +607,33 @@ async def get_graph_sample(
                 attrs[c] = str(v)
         nodes_out.append({
             "id": _norm_id(row["node_id"]),
-            "label": f"node_{_norm_id(row['node_id'])}",
+            "label": _norm_id(row["node_id"]),
             "node_type": str(row["_node_type"]) if "_node_type" in row and not pd.isna(row["_node_type"]) else None,
             "attributes": attrs,
         })
 
+    # Vectorized edge attribute extraction
     edge_attr_cols = [c for c in edges_df.columns if c not in {"src_id", "dst_id", "id", "index"}]
     edges_out = []
-    for _, row in sampled_edges.iterrows():
+    for rec in sampled_edges.to_dict(orient="records"):
         attrs = {}
         for c in edge_attr_cols:
-            v = row[c]
-            if pd.isna(v):
+            v = rec.get(c)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
                 attrs[c] = None
             elif isinstance(v, (int, float, np.integer, np.floating)):
                 attrs[c] = round(float(v), 4) if isinstance(v, (float, np.floating)) else int(v)
             else:
                 attrs[c] = str(v)
+        edge_type_val = rec.get("_edge_type")
         edges_out.append({
-            "source": _norm_id(row["src_id"]),
-            "target": _norm_id(row["dst_id"]),
-            "edge_type": str(row["_edge_type"]) if "_edge_type" in row and not pd.isna(row["_edge_type"]) else None,
+            "source": _norm_id(rec["src_id"]),
+            "target": _norm_id(rec["dst_id"]),
+            "edge_type": str(edge_type_val) if edge_type_val is not None and not (isinstance(edge_type_val, float) and pd.isna(edge_type_val)) else None,
             "attributes": attrs,
         })
 
-    return {
+    payload = {
         "nodes": nodes_out, "edges": edges_out,
         "num_nodes_total": len(nodes_df),
         "num_edges_total": len(edges_df),
@@ -521,7 +643,20 @@ async def get_graph_sample(
         "is_heterogeneous": ds.get("is_heterogeneous", False),
         "node_types": ds.get("node_types", []),
         "edge_types": ds.get("edge_types", []),
+        "graph_index": ds.get("graph_index", []),
     }
+
+    payload_bytes = json.dumps(payload).encode()
+
+    # Store in SQLite cache when a specific graph was requested
+    if cache_graph_id and excel_hash:
+        graph_cache_sqlite.put(dataset_id, cache_graph_id, excel_hash, payload_bytes)
+
+    return Response(
+        content=payload_bytes,
+        media_type="application/json",
+        headers={"ETag": etag},
+    )
 
 
 @router.get("/{project_id}/columns/{column_name}")
@@ -570,7 +705,21 @@ async def impute_missing_endpoint(project_id: str, body: ImputationRequest):
         for _t, _tdf in (ds.get("node_dfs") or {}).items():
             if body.column in _tdf.columns:
                 ds["node_dfs"][_t], _ = impute_column(_tdf, body.column, body.method)
-    # Refresh explore stats
+    # Refresh explore stats — rebuild per-type feature lists from stored schema spec.
+    _node_type_features_imp: dict | None = None
+    _edge_type_features_imp: dict | None = None
+    if _is_hetero:
+        _schema = ds.get("schema_spec") or {}
+        _entries = _schema.get("entries", [])
+        _ntf: dict[str, list[str]] = {}
+        _etf: dict[str, list[str]] = {}
+        for _e in _entries:
+            if _e.get("xy") == "X" and _e.get("level") == "Node":
+                _ntf.setdefault(_e["type"], []).append(_e["parameter"])
+            elif _e.get("xy") == "X" and _e.get("level") == "Edge":
+                _etf.setdefault(_e["type"], []).append(_e["parameter"])
+        _node_type_features_imp = _ntf or None
+        _edge_type_features_imp = _etf or None
     ds["explore_stats"] = compute_generic_explore(
         ds["nodes_df"], ds["edges_df"],
         is_heterogeneous=_is_hetero,
@@ -579,6 +728,8 @@ async def impute_missing_endpoint(project_id: str, body: ImputationRequest):
         canonical_edges=ds.get("canonical_edges", []),
         node_dfs=ds.get("node_dfs") if _is_hetero else None,
         edge_dfs=ds.get("edge_dfs") if _is_hetero else None,
+        node_type_features=_node_type_features_imp,
+        edge_type_features=_edge_type_features_imp,
     )
     store.put_dataset(ds["dataset_id"], ds)
     log = store.get_project(project_id).get("imputation_log", [])

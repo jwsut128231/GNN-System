@@ -55,6 +55,7 @@ export interface SplitMetrics {
   mse: number | null;
   mae: number | null;
   r2_score: number | null;
+  mape?: number | null;
 }
 
 export interface BestConfig {
@@ -123,6 +124,20 @@ export interface ColumnInfo {
   missing_count: number;
   missing_pct: number;
   unique_count: number;
+  // Set on hetero datasets where the same feature can repeat across node/edge types.
+  node_type?: string | null;
+  edge_type?: string | null;
+  // Presence rate across graphs (fraction of graphs that contain this column).
+  presence_pct?: number;
+  low_presence_warning?: boolean;
+}
+
+export interface PerGraphFeatureSchemaEntry {
+  graphs: Record<string, string[]>;
+  union: string[];
+  intersection: string[];
+  presence_per_column: Record<string, number>;
+  low_presence_columns: string[];
 }
 
 export interface GenericExploreData {
@@ -139,6 +154,10 @@ export interface GenericExploreData {
   node_types: string[];
   edge_types: string[];
   canonical_edges: string[][];
+  // Per-graph feature schema breakdown (keyed by node/edge type or 'graph').
+  per_graph_feature_schema?: Record<string, PerGraphFeatureSchemaEntry>;
+  // Warnings from schema analysis (typo detection, low presence, etc.).
+  schema_warnings?: string[];
 }
 
 export interface NumericColumnStats {
@@ -174,11 +193,20 @@ export interface LabelValidationResult {
   is_continuous?: boolean;
 }
 
+export type TaskPhase =
+  | 'queued'
+  | 'preprocessing'
+  | 'hpo'
+  | 'final_training'
+  | 'completed'
+  | 'failed';
+
 export interface TaskStatus {
   task_id: string;
   project_id?: string;
   status: 'QUEUED' | 'PREPROCESSING' | 'TRAINING' | 'COMPLETED' | 'FAILED';
   progress: number;
+  current_phase?: TaskPhase;
   current_trial?: number;
   total_trials?: number;
   device?: string;
@@ -217,11 +245,17 @@ export interface Report {
   test_metrics: SplitMetrics;
   history: Array<{ epoch: number; loss: number; val_loss: number; accuracy?: number; lr?: number }>;
   confusion_matrix: ConfusionMatrix | null;
-  residual_data?: Array<{ actual: number; predicted: number }>;
+  residual_data?: Array<{ actual: number; predicted: number; error: number }>;
   node_predictions?: NodePrediction[];
   best_config?: BestConfig;
   leaderboard?: LeaderboardEntry[];
   is_heterogeneous?: boolean;
+  // Multi-Y support — populated when the dataset declares >1 Y column.
+  // For single-Y the fields stay empty/[] and train_metrics + test_metrics
+  // + residual_data carry the data as before.
+  label_columns?: string[];
+  per_target_metrics?: Record<string, SplitMetrics>;
+  per_target_residuals?: Record<string, Array<{ actual: number; predicted: number; error: number }>>;
 }
 
 export interface RegisteredModel {
@@ -256,6 +290,12 @@ export interface GraphSampleEdge {
   attributes: Record<string, number | string | null>;
 }
 
+export interface GraphIndexEntry {
+  id: string;
+  node_count: number;
+  edge_count: number;
+}
+
 export interface GraphSampleData {
   nodes: GraphSampleNode[];
   edges: GraphSampleEdge[];
@@ -267,6 +307,8 @@ export interface GraphSampleData {
   is_heterogeneous?: boolean;
   node_types?: string[];
   edge_types?: string[];
+  // Structured graph index with node/edge counts per graph (preferred over graph_names).
+  graph_index?: GraphIndexEntry[];
 }
 
 // ══════════════════════════════════════════════
@@ -446,9 +488,19 @@ export const confirmData = async (
 
 export const getProjectGraphSample = async (
   projectId: string,
-  limit: number = 500,
-  graphName?: string,
+  opts: { limit?: number; graph_name?: string } | number = {},
+  legacyGraphName?: string,
 ): Promise<GraphSampleData> => {
+  // Support both old signature (projectId, limit, graphName) and new (projectId, opts).
+  let limit = 500;
+  let graphName: string | undefined;
+  if (typeof opts === 'number') {
+    limit = opts;
+    graphName = legacyGraphName;
+  } else {
+    limit = opts.limit ?? 500;
+    graphName = opts.graph_name;
+  }
   const params = new URLSearchParams({ limit: String(limit) });
   if (graphName) params.set('graph_name', graphName);
   const res = await fetch(`${API_BASE}/api/v1/projects/${projectId}/graph-sample?${params}`);

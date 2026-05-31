@@ -6,9 +6,12 @@ Two code paths:
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import pytorch_lightning as pl
+
+log = logging.getLogger(__name__)
 
 from app.models.gcn import GCNClassifier
 from app.models.gat import GATClassifier
@@ -28,7 +31,10 @@ HOMO_REGISTRY: dict[str, type[pl.LightningModule]] = {
 
 # Backbones to_hetero can lift. MLP/GIN are skipped (MLP has no edges; GIN's
 # inner MLP doesn't play well with to_hetero's per-relation lift).
-HETERO_BACKBONES = ("gcn", "gat", "sage")
+# GCNConv is excluded: it does NOT support bipartite message passing (src ≠ dst
+# node type), which is the common case in heterogeneous graphs. GATConv and
+# SAGEConv both handle bipartite edges correctly.
+HETERO_BACKBONES = ("gat", "sage")
 
 
 def get_model(
@@ -44,9 +50,20 @@ def get_model(
     If ``metadata`` (HeteroData metadata tuple) is provided, returns a
     HeteroGraphRegressor wrapping the named backbone. Otherwise returns the
     standard homogeneous Lightning module.
+
+    ``kwargs`` may include ``num_targets`` and ``loss_weights`` for multi-Y
+    regression — both are passed through to the underlying module.
     """
     if metadata is not None:
-        conv = model_name if model_name in HETERO_BACKBONES else "sage"
+        if model_name in HETERO_BACKBONES:
+            conv = model_name
+        else:
+            conv = "sage"
+            log.warning(
+                "Model '%s' does not support bipartite message passing required for "
+                "heterogeneous graphs; substituting 'sage' (SAGEConv) instead.",
+                model_name,
+            )
         return HeteroGraphRegressor(
             metadata=metadata,
             hidden_dim=kwargs.get("hidden_dim", 64),
@@ -56,6 +73,8 @@ def get_model(
             num_classes=num_classes,
             conv=conv,
             task_type=task_type,
+            num_targets=kwargs.get("num_targets", 1),
+            loss_weights=kwargs.get("loss_weights"),
         )
 
     if model_name not in HOMO_REGISTRY:

@@ -3,19 +3,22 @@
 The graph_data_template.xlsx Parameter sheet declares every feature / label with:
     XY        : "X" (feature) or "Y" (label / prediction target)
     Level     : "Node" | "Edge" | "Graph"
-    Type      : subtype suffix — combined with Level forms the data sheet name,
-                e.g. Level=Node + Type=default  -> sheet "Node_default".
-                Supports heterogeneous graphs via multiple Types per Level.
+    Type      : node/edge type name (e.g. "default", "cell", "pin").
+                Multiple Types per Level → heterogeneous graph.
+                The data sheet (Node/Edge/Graph) may carry a ``Type`` column
+                whose values are split into per-type DataFrames for the PyG
+                converter; absent or all-equal → homogeneous.
     Parameter : column name inside the corresponding data sheet (e.g. "X_1").
     Weight    : loss weight — only meaningful for Y rows; empty ⇒ 1.0.
 
-Phase 2 scope:
-    * Heterogeneous graphs supported (multiple Types per Level).
+Scope:
+    * Heterogeneous graphs supported via in-sheet ``Type`` column.
     * Single Y level (Node OR Graph). Edge-level prediction + multi-task
       remain deferred to a later phase.
 """
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -100,6 +103,57 @@ class ExcelGraphSpec:
         }
 
 
+def validate_hetero_consistency(
+    spec: "ExcelGraphSpec",
+    type_columns: dict[str, list[str]],
+) -> list[str]:
+    """Validate that in-sheet Type values match the Parameter-sheet declared types.
+
+    ``type_columns`` maps level name to the list of distinct Type values that
+    actually appear in the corresponding data sheet's ``Type`` column (empty
+    list when the column is absent or the level has no data sheet).
+
+    Returns a list of warning strings (never raises). Callers should log or
+    attach warnings to the dataset record.
+
+    Rules:
+    - If a data sheet has NO ``Type`` column, it is treated as homogeneous and
+      the Parameter sheet must declare at most one Type for that level (or the
+      declared Type is just used as a label without splitting).
+    - If a data sheet HAS a ``Type`` column, every value that appears in it
+      is checked against Parameter-sheet declarations. Mismatches produce
+      warnings (with fuzzy-match typo hints) instead of raising ValueError.
+    """
+    warnings: list[str] = []
+
+    for level in VALID_LEVELS:
+        declared = spec.types_for_level(level)
+        declared_set = set(declared)
+        in_sheet = set(type_columns.get(level, []))
+
+        if not in_sheet:
+            # No Type column in data sheet — homogeneous path, nothing to validate.
+            continue
+
+        extra_declared = declared_set - in_sheet
+        observed_list = sorted(in_sheet)
+
+        for decl_type in sorted(extra_declared):
+            matches = difflib.get_close_matches(decl_type, observed_list, n=1, cutoff=0.7)
+            if matches:
+                warnings.append(
+                    f"Type '{decl_type}' in Parameter sheet (Level={level}) may be a "
+                    f"typo for '{matches[0]}'"
+                )
+            else:
+                warnings.append(
+                    f"Type '{decl_type}' declared in Parameter sheet (Level={level}) "
+                    f"but not present in Data sheet"
+                )
+
+    return warnings
+
+
 def parse_parameter_sheet(df: pd.DataFrame) -> ExcelGraphSpec:
     """Validate and parse the Parameter sheet DataFrame into an ExcelGraphSpec."""
     if df is None or df.empty:
@@ -144,20 +198,24 @@ def parse_parameter_sheet(df: pd.DataFrame) -> ExcelGraphSpec:
                 f"got {level_raw!r}."
             )
         if not type_:
-            raise ValueError(f"Parameter sheet row {idx + 2}: Type is required.")
+            type_ = "default"
         if not parameter:
             raise ValueError(f"Parameter sheet row {idx + 2}: Parameter name is required.")
 
         weight: Optional[float] = None
-        if xy == "Y" and has_weight:
-            w_raw = _get(row, "Weight")
-            if not pd.isna(w_raw) and str(w_raw).strip() != "":
-                try:
-                    weight = float(w_raw)
-                except (TypeError, ValueError):
-                    raise ValueError(
-                        f"Parameter sheet row {idx + 2}: Weight must be numeric, got {w_raw!r}."
-                    )
+        if xy == "Y":
+            # Default weight for Y rows is 1.0 — applied whether the Weight
+            # column is absent entirely or the cell is blank.
+            weight = 1.0
+            if has_weight:
+                w_raw = _get(row, "Weight")
+                if not pd.isna(w_raw) and str(w_raw).strip() != "":
+                    try:
+                        weight = float(w_raw)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Parameter sheet row {idx + 2}: Weight must be numeric, got {w_raw!r}."
+                        )
 
         entries.append(ParameterEntry(
             xy=xy, level=level, type_=type_, parameter=parameter, weight=weight,

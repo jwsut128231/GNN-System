@@ -4,7 +4,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { sanitizeParam } from '@/lib/sanitize';
 import {
-    Button, Card, Tag, Slider, Switch, Alert, Spin, Space, Table, Tooltip, Progress, Typography, Checkbox, Row, Col, theme,
+    Button, Card, Tag, Slider, Alert, Spin, Space, Table, Tooltip, Progress, Typography, Checkbox, Row, Col, theme,
+    Divider,
 } from 'antd';
 import {
     PlayCircleOutlined, AppstoreOutlined, ClockCircleOutlined,
@@ -19,7 +20,11 @@ import {
 
 const { Title, Text } = Typography;
 
-const ALL_MODELS = ['gcn', 'gat', 'sage', 'gin', 'mlp'];
+const ALL_MODELS_HOMO = ['gcn', 'gat', 'sage', 'gin', 'mlp'];
+// Heterogeneous graphs: GCN/GIN are excluded — both rely on assumptions
+// (single relation type, inner MLP) that break under PyG's `to_hetero` transform.
+// Backend skips them for hetero datasets, so the UI must too.
+const ALL_MODELS_HETERO = ['gat', 'sage', 'mlp'];
 
 function formatTime(seconds: number): string {
     if (seconds < 0) return '\u2014';
@@ -36,8 +41,9 @@ export default function TrainPage() {
 
     const [project, setProject] = useState<ProjectDetail | null>(null);
 
-    const [autoMode, setAutoMode] = useState(true);
-    const [selectedModels, setSelectedModels] = useState<string[]>([]);
+    // v2: single checkbox list. "Select all" is the AutoML affordance — equivalent to sending
+    // an empty models array to the backend (backend already treats that as "search all").
+    const [selectedModels, setSelectedModels] = useState<string[]>(ALL_MODELS_HOMO);
     const [nTrials, setNTrials] = useState(150);
     const [estimate, setEstimate] = useState<TrainingEstimate | null>(null);
     const [estimateLoading, setEstimateLoading] = useState(false);
@@ -54,6 +60,17 @@ export default function TrainPage() {
     const [experiments, setExperiments] = useState<TaskStatus[]>([]);
 
     const hasEdgeAttrs = project?.dataset_summary?.has_edge_attrs;
+    const isHetero = project?.dataset_summary?.is_heterogeneous ?? false;
+    const availableModels = isHetero ? ALL_MODELS_HETERO : ALL_MODELS_HOMO;
+
+    // Drop unsupported models (gcn / gin) when project is hetero — prevents the user
+    // from picking a model the backend will silently skip during training.
+    useEffect(() => {
+        setSelectedModels(prev => {
+            const next = prev.filter(m => availableModels.includes(m));
+            return next.length === prev.length ? prev : (next.length > 0 ? next : availableModels);
+        });
+    }, [isHetero, availableModels]);
 
     useEffect(() => {
         if (!projectId) return;
@@ -137,7 +154,10 @@ export default function TrainPage() {
         setLogs([`[${new Date().toLocaleTimeString()}] Starting training...`]);
         lastLogKey.current = '';
         try {
-            const models = autoMode ? [] : selectedModels;
+            // Backwards-compat: sending [] tells backend "try all" — equivalent to AutoML.
+            // Only send the explicit list when the user has narrowed the selection.
+            const allSelected = selectedModels.length === availableModels.length;
+            const models = allSelected ? [] : selectedModels;
             const status = await startProjectTraining(projectId, models, nTrials);
             setTaskStatus(status);
             setTraining(true);
@@ -155,7 +175,13 @@ export default function TrainPage() {
         ? Math.max(0, elapsed * (100 - progress) / progress)
         : -1;
 
-    const showEdgeAttrWarning = hasEdgeAttrs && !autoMode && selectedModels.includes('mlp');
+    const allSelected = selectedModels.length === availableModels.length;
+    const noneSelected = selectedModels.length === 0;
+    const showEdgeAttrWarning = hasEdgeAttrs && selectedModels.includes('mlp') && !allSelected;
+
+    const toggleSelectAll = (checked: boolean) => {
+        setSelectedModels(checked ? availableModels : []);
+    };
 
     const experimentColumns = [
         { title: '#', dataIndex: 'index', key: 'index', width: 50 },
@@ -219,30 +245,40 @@ export default function TrainPage() {
                 {/* Left: Configuration */}
                 <Col xs={24} md={12}>
                     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-                        <Card title="Model Selection" size="small">
+                        <Card title="Model Families" size="small">
                             <Space direction="vertical" style={{ width: '100%' }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                                    <Switch checked={autoMode} onChange={setAutoMode} />
-                                    <Text type="secondary">Auto (search all models)</Text>
-                                </div>
+                                {/* v2: a single checkbox list. "Select all" is the AutoML switch — checking
+                                    everything tells the backend to search across every family. Darren's
+                                    feedback: IC designers don't want a separate Auto/Manual tab. */}
+                                <Checkbox
+                                    indeterminate={selectedModels.length > 0 && selectedModels.length < availableModels.length}
+                                    checked={allSelected}
+                                    onChange={(e) => toggleSelectAll(e.target.checked)}
+                                >
+                                    <Text strong>Select all</Text>
+                                </Checkbox>
+                                <Divider style={{ margin: '8px 0' }} />
+                                <Checkbox.Group
+                                    value={selectedModels}
+                                    onChange={(vals) => setSelectedModels(vals as string[])}
+                                    style={{ width: '100%' }}
+                                >
+                                    <Space direction="vertical" size={6}>
+                                        {availableModels.map(m => (
+                                            <Tooltip key={m} title={hasEdgeAttrs && m === 'mlp' ? 'MLP does not use edge attributes' : ''}>
+                                                <Checkbox value={m}>{m.toUpperCase()}</Checkbox>
+                                            </Tooltip>
+                                        ))}
+                                    </Space>
+                                </Checkbox.Group>
 
-                                {!autoMode && (
-                                    <Checkbox.Group
-                                        value={selectedModels}
-                                        onChange={(vals) => setSelectedModels(vals as string[])}
-                                        style={{ marginTop: 12 }}
-                                    >
-                                        <Space wrap>
-                                            {ALL_MODELS.map(m => (
-                                                <Tooltip
-                                                    key={m}
-                                                    title={hasEdgeAttrs && m === 'mlp' ? 'MLP does not use edge attributes' : ''}
-                                                >
-                                                    <Checkbox value={m}>{m.toUpperCase()}</Checkbox>
-                                                </Tooltip>
-                                            ))}
-                                        </Space>
-                                    </Checkbox.Group>
+                                {noneSelected && (
+                                    <Alert
+                                        type="warning"
+                                        showIcon
+                                        icon={<WarningOutlined />}
+                                        message="Select at least one model family."
+                                    />
                                 )}
 
                                 {showEdgeAttrWarning && (
@@ -250,7 +286,7 @@ export default function TrainPage() {
                                         type="warning"
                                         showIcon
                                         icon={<WarningOutlined />}
-                                        message="MLP baseline does not use edge attributes. Consider using GCN, GAT, or GraphSAGE for better results with edge features."
+                                        message="MLP baseline does not use edge attributes. Consider GCN, GAT, or GraphSAGE for better results with edge features."
                                     />
                                 )}
                             </Space>
@@ -296,7 +332,7 @@ export default function TrainPage() {
                                 block
                                 icon={<PlayCircleOutlined />}
                                 onClick={handleStart}
-                                disabled={!autoMode && selectedModels.length === 0}
+                                disabled={noneSelected}
                             >
                                 {experiments.length > 0 ? 'Start New Training' : 'Start Training'}
                             </Button>
@@ -335,9 +371,24 @@ export default function TrainPage() {
                         {taskStatus && (
                             <Card title="Training Progress" size="small" className="stat-card">
                                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                                    <Tag color={isCompleted ? 'green' : isFailed ? 'red' : 'processing'}>
-                                        {taskStatus.status}
-                                    </Tag>
+                                    <Space size={4}>
+                                        <Tag color={isCompleted ? 'green' : isFailed ? 'red' : 'processing'}>
+                                            {taskStatus.status}
+                                        </Tag>
+                                        {taskStatus.current_phase && !isCompleted && !isFailed && (
+                                            <Tag color={
+                                                taskStatus.current_phase === 'preprocessing' ? 'cyan' :
+                                                taskStatus.current_phase === 'hpo' ? 'blue' :
+                                                taskStatus.current_phase === 'final_training' ? 'geekblue' :
+                                                'default'
+                                            }>
+                                                {taskStatus.current_phase === 'preprocessing' ? 'Phase 1/3 · Preprocessing' :
+                                                 taskStatus.current_phase === 'hpo' ? 'Phase 2/3 · HPO Search' :
+                                                 taskStatus.current_phase === 'final_training' ? 'Phase 3/3 · Final Training' :
+                                                 taskStatus.current_phase}
+                                            </Tag>
+                                        )}
+                                    </Space>
                                     <Text strong style={{ fontSize: 18, color: token.colorPrimary }}>
                                         {taskStatus.progress}%
                                     </Text>

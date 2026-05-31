@@ -2,11 +2,12 @@
 
 import React, { useState } from 'react';
 import {
-    Button, Avatar, Breadcrumb, Steps, Divider, Tag, Typography, theme, Grid, Drawer, Space,
+    Button, Avatar, Breadcrumb, Steps, Divider, Tag, Typography, theme, Grid, Drawer, Space, Tooltip,
 } from 'antd';
 import {
     UserOutlined, LogoutOutlined,
     SunOutlined, MoonOutlined, MenuOutlined,
+    LockOutlined, CheckOutlined,
 } from '@ant-design/icons';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
@@ -16,20 +17,25 @@ import Image from 'next/image';
 const { Text } = Typography;
 const { useBreakpoint } = Grid;
 
-const STEPS = [
+// v2 pipeline: Create → Upload → Analyze → Train → Evaluate → Predict
+// Register/Models is NOT in the pipeline per v2 — it's linked from Evaluate / project landing instead.
+// Index 0 (Create) navigates back to /dashboard where projects are created.
+export const STEPS = [
+    { label: 'Create' },
     { label: 'Upload' },
-    { label: 'Analysis' },
-    { label: 'Training' },
-    { label: 'Evaluation' },
-    { label: 'Models' },
+    { label: 'Analyze' },
+    { label: 'Train' },
+    { label: 'Evaluate' },
+    { label: 'Predict' },
 ];
 
-const STEP_PATHS = (projectId: string) => [
+export const STEP_PATHS = (projectId: string) => [
+    `/dashboard`,
     `/projects/${projectId}/upload`,
     `/projects/${projectId}/explore`,
     `/projects/${projectId}/train`,
     `/projects/${projectId}/evaluate`,
-    `/projects/${projectId}/models`,
+    `/projects/${projectId}/predict`,
 ];
 
 const STATUS_TAG_COLOR: Record<string, string> = {
@@ -56,15 +62,55 @@ export default function AppHeader({ subtitle, projectName, projectId, projectSte
     const [drawerOpen, setDrawerOpen] = useState(false);
 
     const isProjectMode = !!(projectId && projectName);
-    const activeIndex = isProjectMode ? (projectStep ?? 1) - 1 : -1;
-    const baseMaxIndex = isProjectMode ? (projectStep ?? 1) - 1 : -1;
-    const maxReachableIndex = (projectStatus === 'completed' && baseMaxIndex >= 3) ? 4 : baseMaxIndex;
+    // Translate legacy 1..5 current_step into the 6-step v2 index space (0..5):
+    // legacy 1(upload)→1, 2(analysis)→2, 3(training)→3, 4(evaluation)→4, 5(models)→4.
+    // Create(index 0) maps to the dashboard; it's always reachable.
+    const legacyStep = projectStep ?? 1;
+    const activeIndex = isProjectMode ? Math.min(Math.max(legacyStep, 1), 4) : -1;
+    const baseMaxIndex = activeIndex;
+    // Predict(5) unlocks after Evaluate is reached AND status === 'completed' (a model exists).
+    const maxReachableIndex = isProjectMode
+        ? (projectStatus === 'completed' && baseMaxIndex >= 4 ? 5 : baseMaxIndex)
+        : -1;
 
     const handleStepClick = (index: number) => {
-        if (!projectId) return;
         if (index > maxReachableIndex) return;
+        if (index === 0) {
+            router.push('/dashboard');
+            return;
+        }
+        if (!projectId) return;
         router.push(STEP_PATHS(projectId)[index]);
     };
+
+    // Build AntD Steps items with lock-on-future + check-on-completed semantics.
+    const buildStepItems = () => STEPS.map((s, i) => {
+        const locked = i > maxReachableIndex;
+        const done = i < activeIndex;
+        const isTraining = projectStatus === 'training' && i === 3; // new Train index
+        const baseTitle = s.label;
+        if (locked) {
+            return {
+                title: (
+                    <Tooltip title="Complete previous steps to unlock">
+                        <span style={{ color: token.colorTextDisabled }}>{baseTitle}</span>
+                    </Tooltip>
+                ),
+                icon: <LockOutlined style={{ color: token.colorTextDisabled }} />,
+                disabled: true as const,
+            };
+        }
+        if (done) {
+            return {
+                title: baseTitle,
+                icon: <CheckOutlined style={{ color: token.colorSuccess }} />,
+            };
+        }
+        return {
+            title: baseTitle,
+            status: isTraining ? ('process' as const) : undefined,
+        };
+    });
 
     const logoSection = (
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
@@ -189,11 +235,7 @@ export default function AppHeader({ subtitle, projectName, projectId, projectSte
                                 direction="vertical"
                                 size="small"
                                 onChange={(i) => { handleStepClick(i); setDrawerOpen(false); }}
-                                items={STEPS.map((s, i) => ({
-                                    title: s.label,
-                                    disabled: i > maxReachableIndex,
-                                    status: (projectStatus === 'training' && i === 2) ? 'process' as const : undefined,
-                                }))}
+                                items={buildStepItems()}
                             />
                         )}
                         {user && (
@@ -234,13 +276,9 @@ export default function AppHeader({ subtitle, projectName, projectId, projectSte
                 <Steps
                     current={activeIndex}
                     size="small"
-                    style={{ flex: 2, maxWidth: 600 }}
+                    style={{ flex: 2, maxWidth: 720 }}
                     onChange={handleStepClick}
-                    items={STEPS.map((s, i) => ({
-                        title: s.label,
-                        disabled: i > maxReachableIndex,
-                        status: (projectStatus === 'training' && i === 2) ? 'process' as const : undefined,
-                    }))}
+                    items={buildStepItems()}
                 />
             )}
             {rightSection}

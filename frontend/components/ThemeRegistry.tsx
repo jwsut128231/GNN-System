@@ -26,12 +26,16 @@ function BodyStyleSync({ mode }: { mode: 'light' | 'dark' }) {
 }
 
 export default function ThemeRegistry({ children }: { children: React.ReactNode }) {
-  const [mode, setMode] = React.useState<'light' | 'dark'>(() => {
-    if (typeof window !== 'undefined') {
-      return (localStorage.getItem('color_mode') as 'light' | 'dark') || 'light';
-    }
-    return 'light';
-  });
+  // Always initialize to 'light' so SSR and first client render agree (avoids hydration mismatch).
+  // The useEffect below reads localStorage after mount and switches if needed.
+  const [mode, setMode] = React.useState<'light' | 'dark'>('light');
+  const [mounted, setMounted] = React.useState(false);
+
+  React.useEffect(() => {
+    const saved = localStorage.getItem('color_mode') as 'light' | 'dark' | null;
+    if (saved) setMode(saved);
+    setMounted(true);
+  }, []);
 
   const colorMode = React.useMemo(
     () => ({
@@ -47,15 +51,23 @@ export default function ThemeRegistry({ children }: { children: React.ReactNode 
     [mode],
   );
 
-  const themeConfig = React.useMemo(() => getTheme(mode), [mode]);
+  // Before mount, force light algorithm so ConfigProvider token values are stable between
+  // SSR and first client paint. Dashboard inline styles (colorBgContainer, colorPrimary, etc.)
+  // derive from these tokens — mismatching them is what triggers the visual layout glitch.
+  const themeConfig = React.useMemo(
+    () => mounted ? getTheme(mode) : { ...getTheme('light'), algorithm: antdTheme.defaultAlgorithm },
+    [mode, mounted],
+  );
 
   return (
+    // suppressHydrationWarning: the data-theme attribute on <html> is written client-side
+    // by BodyStyleSync; React would otherwise warn about the server/client attribute mismatch.
     <AntdRegistry>
       <ColorModeContext.Provider value={colorMode}>
         <ConfigProvider theme={themeConfig}>
           <App>
             <BodyStyleSync mode={mode} />
-            {children}
+            <div suppressHydrationWarning>{children}</div>
           </App>
         </ConfigProvider>
       </ColorModeContext.Provider>

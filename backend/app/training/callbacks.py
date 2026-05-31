@@ -91,6 +91,7 @@ class ProgressCallback(pl.Callback):
             self.task_id,
             progress=progress,
             status="TRAINING",
+            current_phase="final_training",
             history=list(self.history),
         )
 
@@ -117,4 +118,5 @@ class TrialProgressCallback:
             current_trial=completed,
             total_trials=self.n_trials,
             progress=raw,
+            current_phase="hpo",
         )

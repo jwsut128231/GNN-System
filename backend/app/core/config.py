@@ -8,11 +8,14 @@ class Settings(BaseSettings):
     DEMO_DATA_DIR: Path = Path(__file__).resolve().parent.parent.parent / "demo_data"
 
     # ── Training quality knobs (Phase 3) ──
-    MAX_EPOCHS: int = 50
-    MAX_HPO_EPOCHS: int = 15
-    PATIENCE: int = 10
-    HPO_PATIENCE: int = 3
-    LR_SCHED_PATIENCE: int = 3
+    # 2026-04-28: bumped epoch / patience budgets to give the smaller lr range
+    # (1e-5 .. 1e-4) enough iterations to converge — the previous 50/10 budget
+    # plateaued early and produced bouncing val curves on demo-scale data.
+    MAX_EPOCHS: int = 200
+    MAX_HPO_EPOCHS: int = 30
+    PATIENCE: int = 30
+    HPO_PATIENCE: int = 6
+    LR_SCHED_PATIENCE: int = 6
     OPTUNA_TRIALS: int = 150
     GRADIENT_CLIP: float = 1.0
     # PyTorch Lightning precision:

@@ -31,6 +31,7 @@ import pytorch_lightning as pl
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     mean_squared_error, mean_absolute_error, r2_score,
+    mean_absolute_percentage_error,
     confusion_matrix as sklearn_confusion_matrix,
 )
 from torch_geometric.loader import DataLoader
@@ -50,10 +51,13 @@ log = logging.getLogger(__name__)
 # ── metric helpers ────────────────────────────────────────────────────────
 
 def _regression_metrics(y_true, y_pred) -> dict:
+    arr = np.asarray(y_true)
+    mape = None if (arr == 0).any() else round(float(mean_absolute_percentage_error(y_true, y_pred)), 4)
     return {
         "mse": round(float(mean_squared_error(y_true, y_pred)), 4),
         "mae": round(float(mean_absolute_error(y_true, y_pred)), 4),
         "r2_score": round(float(r2_score(y_true, y_pred)), 4),
+        "mape": mape,
     }
 
 
@@ -77,13 +81,14 @@ def _device_pair() -> tuple[str, str]:
 
 
 def _trainer(task_id: str, max_epochs: int, callbacks: list, checkpoint_dir: Path,
-             accelerator: str, precision: str) -> pl.Trainer:
+             accelerator: str, precision: str, is_regression: bool = False) -> pl.Trainer:
+    monitor = "val_mae" if is_regression else "val_loss"
     ckpt = pl.callbacks.ModelCheckpoint(
         dirpath=str(checkpoint_dir), filename="best",
-        monitor="val_loss", mode="min", save_top_k=1, save_weights_only=True,
+        monitor=monitor, mode="min", save_top_k=1, save_weights_only=True,
     )
     es = pl.callbacks.EarlyStopping(
-        monitor="val_loss", patience=settings.PATIENCE, mode="min",
+        monitor=monitor, patience=settings.PATIENCE, mode="min",
     )
     return pl.Trainer(
         max_epochs=max_epochs,
@@ -121,24 +126,30 @@ def _split_three(items: list, generator: torch.Generator) -> tuple[list, list, l
 
 # ── data prep branches ────────────────────────────────────────────────────
 
+def _label_columns_for(dataset: dict) -> list[str]:
+    return list(dataset.get("label_columns") or [dataset["label_column"]])
+
+
 def _prepare_hetero(dataset: dict, generator: torch.Generator):
+    label_columns = _label_columns_for(dataset)
     parsed = {
         "node_dfs": dataset["node_dfs"],
         "edge_dfs": dataset["edge_dfs"],
         "graph_df": dataset["graph_df"],
         "label_column": dataset["label_column"],
+        "label_columns": label_columns,
         "canonical_edges": dataset["canonical_edges"],
     }
-    data_list, _s, _f, _ce = parsed_excel_to_hetero_list(parsed)
+    data_list, _s, _f, _ce, _excl = parsed_excel_to_hetero_list(parsed)
     metadata = data_list[0].metadata()
     num_classes = 1 if dataset["task_type"].endswith("regression") else 2
     train, val, test = _split_three(data_list, generator)
 
-    # Regression target standardization
+    # Regression target standardization (scalar OR per-target vector).
     is_regression = dataset["task_type"].endswith("regression")
     scaler = TargetScaler.identity_()
     if is_regression:
-        train_y = np.concatenate([d.y.cpu().numpy() for d in train])
+        train_y = np.concatenate([d.y.cpu().numpy() for d in train], axis=0)
         scaler = TargetScaler.fit(train_y)
         for d in train + val:   # apply only to train+val; test stays raw for unscaled metric
             d.y = scaler.transform_tensor(d.y)
@@ -146,9 +157,10 @@ def _prepare_hetero(dataset: dict, generator: torch.Generator):
 
 
 def _prepare_graph_homo(dataset: dict, generator: torch.Generator):
+    label_columns = _label_columns_for(dataset)
     data_list, _s, _f, num_classes = dataframes_to_graph_list(
         dataset["nodes_df"], dataset["edges_df"], dataset.get("graph_df"),
-        label_column=dataset["label_column"], task_type=dataset["task_type"],
+        label_column=label_columns, task_type=dataset["task_type"],
         fit_scaler=True,
     )
     train, val, test = _split_three(data_list, generator)
@@ -156,7 +168,7 @@ def _prepare_graph_homo(dataset: dict, generator: torch.Generator):
     is_regression = dataset["task_type"].endswith("regression")
     scaler = TargetScaler.identity_()
     if is_regression:
-        train_y = np.concatenate([d.y.cpu().numpy() for d in train])
+        train_y = np.concatenate([d.y.cpu().numpy() for d in train], axis=0)
         scaler = TargetScaler.fit(train_y)
         for d in train + val:
             d.y = scaler.transform_tensor(d.y)
@@ -164,14 +176,15 @@ def _prepare_graph_homo(dataset: dict, generator: torch.Generator):
 
 
 def _prepare_node(dataset: dict):
+    label_columns = _label_columns_for(dataset)
     train_data, _scaler, _ = dataframes_to_pyg_dynamic(
         dataset["nodes_df_train"], dataset["edges_df_train"],
-        label_column=dataset["label_column"], task_type=dataset["task_type"],
+        label_column=label_columns, task_type=dataset["task_type"],
         fit_scaler=True,
     )
     test_data, _, _ = dataframes_to_pyg_dynamic(
         dataset["nodes_df_test"], dataset["edges_df_test"],
-        label_column=dataset["label_column"], task_type=dataset["task_type"],
+        label_column=label_columns, task_type=dataset["task_type"],
         fit_scaler=True,
     )
     num_classes = getattr(train_data, "num_classes", 2)
@@ -242,6 +255,19 @@ def run_training_task(task_id: str) -> None:
         n_trials = task.get("n_trials", settings.OPTUNA_TRIALS)
         models_filter = task.get("models")
 
+        # Multi-Y metadata.
+        label_columns: list[str] = list(
+            dataset.get("label_columns") or [dataset.get("label_column")]
+        )
+        label_weights_list: list[float] = list(
+            dataset.get("label_weights") or [dataset.get("label_weight") or 1.0]
+        )
+        num_targets = len(label_columns)
+        loss_weights_tensor = (
+            torch.tensor(label_weights_list, dtype=torch.float)
+            if num_targets > 1 else None
+        )
+
         accelerator, precision = _device_pair()
         device_str = "cuda" if accelerator == "gpu" else "cpu"
         if accelerator == "gpu":
@@ -251,6 +277,7 @@ def run_training_task(task_id: str) -> None:
 
         store.update_task(
             task_id, device=device_str, status="PREPROCESSING", progress=5,
+            current_phase="preprocessing",
             current_trial=0, total_trials=n_trials,
         )
 
@@ -281,6 +308,7 @@ def run_training_task(task_id: str) -> None:
 
         store.update_task(
             task_id, progress=15, status="TRAINING",
+            current_phase="hpo",
             current_trial=0, total_trials=n_trials,
         )
 
@@ -291,10 +319,13 @@ def run_training_task(task_id: str) -> None:
             task_type=task_type, models=models_filter, task_id=task_id,
             accelerator=accelerator, precision=precision,
             metadata=metadata,
+            num_targets=num_targets,
+            loss_weights=loss_weights_tensor,
         )
 
         store.update_task(
             task_id, progress=50, best_config=best_config,
+            current_phase="final_training",
             current_trial=best_config.get("completed_trials", n_trials),
             total_trials=n_trials,
         )
@@ -302,8 +333,7 @@ def run_training_task(task_id: str) -> None:
         # ── Build model ──
         is_regression = task_type.endswith("regression")
         effective_classes = 1 if is_regression else num_classes
-        model = get_model(
-            best_config["model_name"],
+        final_kwargs: dict = dict(
             num_features=num_features,
             num_classes=effective_classes,
             task_type=task_type,
@@ -313,6 +343,11 @@ def run_training_task(task_id: str) -> None:
             dropout=best_config["dropout"],
             lr=best_config["lr"],
         )
+        if is_regression:
+            final_kwargs["num_targets"] = num_targets
+            if loss_weights_tensor is not None:
+                final_kwargs["loss_weights"] = loss_weights_tensor
+        model = get_model(best_config["model_name"], **final_kwargs)
 
         # ── DataLoaders ──
         if isinstance(train_items, list):
@@ -338,6 +373,7 @@ def run_training_task(task_id: str) -> None:
             task_id=task_id, max_epochs=settings.MAX_EPOCHS,
             callbacks=[progress_cb], checkpoint_dir=ckpt_dir,
             accelerator=accelerator, precision=precision,
+            is_regression=is_regression,
         )
 
         t0 = time.time()
@@ -351,28 +387,85 @@ def run_training_task(task_id: str) -> None:
             model.load_state_dict(state["state_dict"])
 
         # ── Evaluation ──
+        # Graph-level paths (_prepare_hetero / _prepare_graph_homo) scale BOTH
+        # train and val items, so train_y AND val_y must be inverse-scaled
+        # before metric computation. Forgetting val_y produced absurd val
+        # metrics (R²=-30+, MAPE in the thousands) — see 2026-04-28 fix.
+        # Node-level path (_prepare_node) scales train only; val_items reuses
+        # the unscaled test data, so val_y is already in raw space and must
+        # NOT be inverse-scaled a second time.
         if isinstance(train_items, list):
             train_preds, train_y = _predict_list(model, train_items, task_type, is_hetero, scaler)
-            # Unscale the train-side y for metric parity with test (train y is currently scaled).
+            val_preds, val_y = _predict_list(model, val_items, task_type, is_hetero, scaler)
+            test_preds, test_y = _predict_list(model, test_items, task_type, is_hetero, scaler)
             if is_regression:
                 train_y = scaler.inverse_np(train_y)
-            test_preds, test_y = _predict_list(model, test_items, task_type, is_hetero, scaler)
+                val_y = scaler.inverse_np(val_y)
         else:
             train_preds, train_y = _predict_single(model, train_items, task_type, scaler)
+            val_preds, val_y = _predict_single(model, val_items, task_type, scaler)
+            test_preds, test_y = _predict_single(model, test_items, task_type, scaler)
             if is_regression:
                 train_y = scaler.inverse_np(train_y)
-            test_preds, test_y = _predict_single(model, test_items, task_type, scaler)
 
+        per_target_metrics: dict = {}
+        per_target_residuals: dict = {}
         if is_regression:
-            train_metrics = _regression_metrics(train_y, train_preds)
-            test_metrics = _regression_metrics(test_y, test_preds)
-            cm = None
-            residual = [
-                {"actual": round(float(test_y[i]), 4), "predicted": round(float(test_preds[i]), 4)}
-                for i in range(min(500, len(test_y)))
-            ]
+            if num_targets > 1:
+                # Compute metrics per Y column; aggregate by mean for the
+                # backward-compatible overall train/val/test metrics fields.
+                target_metrics_test: list[dict] = []
+                target_metrics_train: list[dict] = []
+                target_metrics_val: list[dict] = []
+                for i, col in enumerate(label_columns):
+                    tr_m = _regression_metrics(train_y[:, i], train_preds[:, i])
+                    va_m = _regression_metrics(val_y[:, i], val_preds[:, i])
+                    te_m = _regression_metrics(test_y[:, i], test_preds[:, i])
+                    target_metrics_train.append(tr_m)
+                    target_metrics_val.append(va_m)
+                    target_metrics_test.append(te_m)
+                    per_target_metrics[col] = te_m
+                    per_target_residuals[col] = [
+                        {
+                            "actual": round(float(test_y[j, i]), 4),
+                            "predicted": round(float(test_preds[j, i]), 4),
+                            "error": round(float(test_y[j, i] - test_preds[j, i]), 4),
+                        }
+                        for j in range(min(500, len(test_y)))
+                    ]
+                train_metrics = {
+                    k: round(float(np.mean([m[k] for m in target_metrics_train])), 4)
+                    for k in target_metrics_train[0]
+                }
+                val_metrics = {
+                    k: round(float(np.mean([m[k] for m in target_metrics_val])), 4)
+                    for k in target_metrics_val[0]
+                }
+                test_metrics = {
+                    k: round(float(np.mean([m[k] for m in target_metrics_test])), 4)
+                    for k in target_metrics_test[0]
+                }
+                cm = None
+                # Residual scatter falls back to the first target for the
+                # legacy single-axis plot; per-target plots live in
+                # ``per_target_residuals``.
+                residual = per_target_residuals[label_columns[0]]
+            else:
+                train_metrics = _regression_metrics(train_y, train_preds)
+                val_metrics = _regression_metrics(val_y, val_preds)
+                test_metrics = _regression_metrics(test_y, test_preds)
+                cm = None
+                residual = [
+                    {
+                        "actual": round(float(test_y[i]), 4),
+                        "predicted": round(float(test_preds[i]), 4),
+                        "error": round(float(test_y[i] - test_preds[i]), 4),
+                    }
+                    for i in range(min(500, len(test_y)))
+                ]
         else:
             train_metrics = _classification_metrics(train_y, train_preds)
+            val_metrics = _classification_metrics(val_y, val_preds)
             test_metrics = _classification_metrics(test_y, test_preds)
             labels = sorted(set(test_y.tolist()) | set(test_preds.tolist()))
             cm_arr = sklearn_confusion_matrix(test_y, test_preds, labels=labels)
@@ -382,7 +475,7 @@ def run_training_task(task_id: str) -> None:
         report = {
             "task_type": task_type,
             "train_metrics": train_metrics,
-            "val_metrics": dict(test_metrics),
+            "val_metrics": val_metrics,
             "test_metrics": test_metrics,
             "history": progress_cb.history,
             "confusion_matrix": cm,
@@ -397,10 +490,14 @@ def run_training_task(task_id: str) -> None:
             },
             "leaderboard": best_config.get("leaderboard", []),
             "is_heterogeneous": is_hetero,
+            "label_columns": label_columns,
+            "per_target_metrics": per_target_metrics,
+            "per_target_residuals": per_target_residuals,
         }
 
         store.update_task(
             task_id, status="COMPLETED", progress=100,
+            current_phase="completed",
             results={
                 "train_metrics": train_metrics,
                 "test_metrics": test_metrics,
@@ -421,6 +518,9 @@ def run_training_task(task_id: str) -> None:
             "num_classes": effective_classes,
             "task_type": task_type,
             "label_column": dataset.get("label_column"),
+            "label_columns": label_columns,
+            "label_weights": label_weights_list,
+            "num_targets": num_targets,
             "hidden_dim": best_config["hidden_dim"],
             "num_layers": best_config["num_layers"],
             "dropout": best_config["dropout"],
@@ -459,6 +559,7 @@ def run_training_task(task_id: str) -> None:
     except Exception:
         log.exception("Training task %s failed", task_id)
         store.update_task(task_id, status="FAILED", progress=0,
+                          current_phase="failed",
                           error="Training failed. Check server logs for details.")
         tk = store.get_task(task_id) or {}
         if tk.get("project_id"):

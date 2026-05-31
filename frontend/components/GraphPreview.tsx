@@ -54,9 +54,12 @@ function getNodeColor(node: GraphSampleNode, typeColors: Record<string, string>)
 
 interface GraphPreviewProps {
   graphSample: GraphSampleData;
+  /** Optional canvas height override in px. Defaults to 420. Used by the Explore fullscreen modal. */
+  height?: number;
 }
 
-export default function GraphPreview({ graphSample }: GraphPreviewProps) {
+function GraphPreview({ graphSample, height: heightProp }: GraphPreviewProps) {
+  const canvasHeight = heightProp ?? 420;
   const { token } = theme.useToken();
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
@@ -93,7 +96,7 @@ export default function GraphPreview({ graphSample }: GraphPreviewProps) {
       }))
       .filter(l => nodeIdSet.has(l.source) && nodeIdSet.has(l.target));
     return { nodes, links };
-  }, [graphSample]);
+  }, [graphSample, typeColors]);
 
   const detailNode = useMemo(() => {
     const id = selectedNodeId || hoveredNodeId;
@@ -213,7 +216,7 @@ export default function GraphPreview({ graphSample }: GraphPreviewProps) {
           ref={containerRef}
           style={{
             flex: 1,
-            height: 420,
+            height: canvasHeight,
             borderRadius: 8,
             border: `1px solid ${token.colorBorderSecondary}`,
             overflow: 'hidden',
@@ -224,7 +227,7 @@ export default function GraphPreview({ graphSample }: GraphPreviewProps) {
           <ForceGraph2D
             graphData={graphData}
             width={Math.max(300, containerWidth - 2)}
-            height={418}
+            height={canvasHeight - 2}
             nodeCanvasObject={nodeCanvasObject}
             nodePointerAreaPaint={(node: { x?: number; y?: number; [key: string]: unknown }, color: string, ctx: CanvasRenderingContext2D) => {
               ctx.beginPath();
@@ -341,3 +344,5 @@ export default function GraphPreview({ graphSample }: GraphPreviewProps) {
     </>
   );
 }
+
+export default React.memo(GraphPreview);

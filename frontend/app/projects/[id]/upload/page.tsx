@@ -175,8 +175,9 @@ export default function UploadPage() {
                     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
                         <Text type="secondary" style={{ fontSize: 13 }}>
                             Fill the <code>Parameter</code> sheet to declare features and labels,
-                            then fill the <code>Node_*</code> / <code>Edge_*</code> / <code>Graph_*</code> sheets with data.
-                            Heterogeneous graphs are supported by declaring multiple Types per Level.
+                            then fill the <code>Node</code>, <code>Edge</code>, and <code>Graph</code> sheets with data.
+                            For heterogeneous graphs, add a <code>Type</code> column to <code>Node</code> / <code>Edge</code> rows
+                            to distinguish node and edge types.
                         </Text>
                         <input
                             ref={excelInputRef}

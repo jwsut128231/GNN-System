@@ -63,3 +63,11 @@ Thumbs.db
 *.tsbuildinfo
 next-env.d.ts
 .vercel
+
+# ──────────────────────────────────────────────
+# Tooling caches (ruff, swc) and OMC working state
+# ──────────────────────────────────────────────
+.ruff_cache/
+.swc/
+.omc/
+.design-ref/
